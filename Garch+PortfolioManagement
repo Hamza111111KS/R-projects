@@ -1,0 +1,271 @@
+# Load libraries
+library(quantmod)
+library(rugarch)
+library(PortfolioAnalytics)
+library(DEoptim)
+library(ROI)
+library(tidyverse)
+
+
+# Set up data
+btc <- getSymbols("BTC-USD", src = "yahoo", auto.assign = FALSE)
+btc <- Ad(btc)
+btc <- to.weekly(btc)
+btc <- to.monthly(btc)
+btc <- btc["2020-01-01/"]
+
+sp500 <- getSymbols("^GSPC", src = "yahoo", auto.assign = FALSE)
+sp500 <- Ad(sp500)
+sp500 <- to.weekly(sp500)
+sp500 <- to.monthly(sp500)
+sp500 <- sp500["2020-01-01/"]
+
+
+# create a data frame with three columns
+# create a data frame with two columns
+btc <- data.frame(btc = rnorm(300), date = seq(as.Date("2022-01-01"), by = "day", length.out = 300))
+sp500 <- data.frame(sp500 = rnorm(300), date = seq(as.Date("2022-01-01"), by = "day", length.out = 300))
+data <- merge.xts(xts(btc[, 1], btc[, 2]), xts(sp500[, 1], sp500[, 2]))
+
+
+# set column names
+colnames(data) <- c("btc", "sp500")
+
+# Merge data
+data <- merge(btc, sp500,by="date")
+colnames(data) <- c("date","btc", "sp500")
+
+# GARCH model for Bitcoin
+# Check for missing values
+any(is.na(data))
+
+# Remove missing values
+data <- na.omit(data)
+
+# Fit GARCH model
+spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(1, 0)))
+garch_fit <- ugarchfit(spec, data$btc, solver = "hybrid")
+
+# Backtesting
+
+# define the length of the rolling window in days
+window_length <- 30
+
+# create an empty data frame to store the backtest results
+backtest <- data.frame(actual = numeric(0), forecast = numeric(0))
+
+# loop over the rolling windows
+for (i in seq(window_length, nrow(data) - window_length + 1, by = 1)) {
+  # extract the data for the current window
+  window_data <- data[(i - window_length + 1):i, ]
+  
+  # fit the GARCH model to the current window
+  fit <- ugarchfit(spec, window_data[, "btc"], solver = "hybrid")
+  
+  # forecast the next day's return using the fitted model
+  pred <- ugarchforecast(fit, n.ahead = 1)
+  
+  # store the actual return and the forecasted return in the backtest data frame
+  backtest <- rbind(backtest, data.frame(actual = window_data[window_length, "btc"],
+                                         forecast = as.numeric(pred@forecast$seriesFor)))
+}
+
+
+# calculate the backtest performance metrics
+mse <- mean((backtest$actual - backtest$forecast)^2)
+mae <- mean(abs(backtest$actual - backtest$forecast))
+rmse <- sqrt(mse)
+
+# print the performance metrics
+cat("MSE:", mse, "\n")
+cat("MAE:", mae, "\n")
+cat("RMSE:", rmse, "\n")
+
+
+# Pair trading strategy
+ratio <- data$btc/data$sp500
+zscore <- (ratio - mean(ratio))/sd(ratio)
+
+# Define entry and exit thresholds
+entry.threshold <- 2
+exit.threshold <- 1
+
+# Compute long and short signals
+long.signal <- ifelse(zscore < -entry.threshold, 1, 0)
+short.signal <- ifelse(zscore > entry.threshold, 1, 0)
+
+# Compute positions
+position <- numeric(length(zscore))
+position[1] <- 0
+
+for (i in 2:length(zscore)) {
+  if (position[i-1] == 0 & long.signal[i] == 1) {
+    position[i] <- 1
+  } else if (position[i-1] == 0 & short.signal[i] == 1) {
+    position[i] <- -1
+  } else if (position[i-1] == 1 & zscore[i] > -exit.threshold) {
+    position[i] <- 0
+  } else if (position[i-1] == -1 & zscore[i] < exit.threshold) {
+    position[i] <- 0
+  } else {
+    position[i] <- position[i-1]
+  }
+}
+
+if (length(position) > 0) {
+  returns <- c(0, diff(log(ratio))) * position
+}else if (is.na(returns) | is.infinite(returns))
+  returns <- 0
+
+# Compute performance metrics
+sharpe <- mean(returns)/sd(returns)
+sortino <- mean(returns[returns < 0])/sd(returns[returns < 0])
+max.drawdown <- max(cummax(returns) - returns)/cummax(returns)
+
+# Print performance metrics
+cat("Sharpe ratio:", sharpe, "\n")
+cat("Sortino ratio:", sortino, "\n")
+cat("Maximum drawdown:", max.drawdown, "\n")
+
+# Convert columns to integer type
+data[, c(2, 3)] <- lapply(data[, c(2, 3)], as.numeric)
+data$date <- as.Date(data$date, format = "%Y-%m-%d")
+
+# Portfolio Optimization
+port <- portfolio.spec(assets = c("btc","sp500"))
+port <- add.constraint(port, type = "weight_sum", min_sum = 0.99, max_sum = 1.01)
+port <- add.constraint(port, type = "box", min = 0.01, max = 0.5)
+port <- add.objective(port, type = "return", name = "mean")
+port <- add.objective(port, type = "risk", name = "StdDev")
+opt <- optimize.portfolio(data, port, optimize_method = "random")
+
+print(opt)
+
+
+
+# Compute covariance matrix
+cov.mat <- cov(data[,2:3])
+
+
+# Compute asset returns
+returns <- apply(data[,2:3], 2, function(x) {
+  ifelse(lag(x) > 0, log(x/lag(x)), NA)
+})[-1, ]
+colnames(returns) <- colnames(data[,2:3])
+
+
+
+# Set up optimization problem
+mv_portfolio_weights <- solve.QP(cov.mat, rep(0, ncol(data)),
+                                 matrix(1, nrow = 1), 1,
+                                 meq = 1)$solution
+mv_portfolio_weights <- mv_portfolio_weights/sum(mv_portfolio_weights)
+
+# Compute portfolio returns and volatility
+mv_portfolio_return <- sum(colMeans(returns) * mv_portfolio_weights)
+mv_portfolio_volatility <- sqrt(t(mv_portfolio_weights) %*% cov.mat %*% mv_portfolio_weights)
+
+# Compute portfolio VaR and CVaR
+alpha <- 0.05
+mv_portfolio_var <- -qnorm(alpha) * mv_portfolio_volatility * mv_portfolio_return
+mv_portfolio_cvar <- -(1/alpha) * (1/sqrt(2*pi)) * exp(-dnorm(qnorm(alpha))/sqrt(2) * mv_portfolio_volatility) * mv_portfolio_return
+
+# Define function to calculate capital required for a given level of risk
+calculate_required_capital <- function(return_target, risk_level, alpha, data) {
+  
+  # Compute covariance matrix
+  cov.mat <- cov(data)
+  
+  # Compute asset weights for minimum variance portfolio
+  mv_portfolio_weights <- solve.QP(cov.mat, rep(0, ncol(data)),
+                                   matrix(1, nrow = 1), 1,
+                                   meq = 1)$solution
+  mv_portfolio_weights <- mv_portfolio_weights/sum(mv_portfolio_weights)
+  
+  # Compute portfolio returns and volatility
+  mv_portfolio_return <- sum(colMeans(returns) * mv_portfolio_weights)
+  mv_portfolio_volatility <- sqrt(t(mv_portfolio_weights) %*% cov.mat %*% mv_portfolio_weights)
+  
+  # Compute portfolio VaR and CVaR
+  mv_portfolio_var <- -qnorm(alpha) * mv_portfolio_volatility * mv_portfolio_return
+  mv_portfolio_cvar <- -(1/alpha) * (1/sqrt(2*pi)) * exp(-dnorm(qnorm(alpha))/sqrt(2) * mv_portfolio_volatility) * mv_portfolio_return
+  
+  # Calculate required capital
+  required_capital <- (risk_level * return_target)/(mv_portfolio_return - mv_portfolio_cvar)
+  
+  return(required_capital)
+}
+
+# Example usage of function
+required_capital <- calculate_required_capital(0.05, 1000000, 0.05, data)
+print(required_capital)
+
+
+# calculate the VaR and CVaR of pair trading strategy:
+
+
+# Compute daily returns
+daily_returns <- c(0, diff(log(ratio)))
+
+# Compute VaR and CVaR
+var_95 <- quantile(daily_returns, 0.05)
+cvar_95 <- mean(daily_returns[daily_returns < var_95])
+
+# Print results
+cat("VaR (95%):", round(var_95, 4), "\n")
+cat("CVaR (95%):", round(cvar_95, 4), "\n")
+
+# function to set stop-loss limits:
+
+set_stop_loss <- function(data, threshold) {
+  # Compute the difference between the two securities
+  diff <- data[,1] - data[,2]
+  
+  # Compute the rolling mean and standard deviation of the difference
+  ma <- SMA(diff, n = 20)
+  sd <- runSD(diff, n = 20)
+  
+  # Compute the lower and upper stop-loss limits
+  lower <- ma - threshold * sd
+  upper <- ma + threshold * sd
+  
+  # Identify the dates when the difference breaches the stop-loss limits
+  breaches <- diff < lower | diff > upper
+  
+  # Set the stop-loss limits
+  stop_loss <- data.frame(lower, upper, breaches)
+  
+  # Return the stop-loss limits
+  return(stop_loss)
+}
+
+# Function to calculate the amount of capital required to hold a certain level of risk
+# Inputs:
+#   - data: dataframe of historical asset prices
+#   - target_risk: target level of risk (e.g. 10%)
+# Outputs:
+#   - capital_required: amount of capital required to hold the target level of risk
+
+calculate_capital_required <- function(data, target_risk) {
+  
+  # Calculate the returns
+  returns <- apply(data, 2, function(x) diff(log(x)))
+  
+  # Calculate the covariance matrix
+  cov_mat <- cov(returns)
+  
+  # Calculate the portfolio risk
+  port_var <- t(c(rep(1, ncol(data)))) %*% cov_mat %*% rep(1, ncol(data))
+  port_sd <- sqrt(port_var)
+  
+  # Calculate the capital required
+  capital_required <- target_risk / port_sd^2
+  
+  return(capital_required)
+}
+
+# Call the function with example data and a target risk level of 10%
+capital_required <- calculate_capital_required(data, 0.1)
+#This will return the amount of capital required to hold a portfolio with a risk level of 10%. You can adjust the target risk level as needed.
+
